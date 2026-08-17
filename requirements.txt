@@ -1,0 +1,4 @@
+# torch version (torch: 2.5.1, built for CUDA 12.1).
+# Run `pip freeze | grep -iE "^(torch|numpy)=="` in your actual venv and replace both lines below
+torch==2.5.1
+numpy==1.26.4
