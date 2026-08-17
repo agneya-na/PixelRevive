@@ -1,4 +1,4 @@
-# AI-Based Restoration of Degraded Images — Team PixelRevive
+# AI-Based Restoration of Degraded Images - Team PixelRevive
 
 PixelRevive: deep learning model for restoring degraded grayscale semiconductor
 inspection images with 2x resolution enhancement (denoising + super-resolution
