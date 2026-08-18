@@ -22,7 +22,7 @@ degraded grayscale semiconductor images. KLA hackathon submission.
 │   │                             #   `from models.model import RestoreNet` by both
 │   │                             #   run.py and train.py
 │   └── restorenet_final.pt      # Component 4 -- trained weights
-└── restored_test_outputs/       # Component 5 -- our model's output on the test set
+└── restored_test_outputs.zip       # Component 5 -- our model's output on the test set
     ├── 000000.png
     ├── 000001.png
     └── ...
