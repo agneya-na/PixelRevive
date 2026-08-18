@@ -12,18 +12,17 @@ This README alone is enough to clone this repo and run inference.
 <team_name>/
 ├── README.md                    # this file
 ├── run.py                       # REQUIRED evaluation script
-├── model.py                     # RestoreNet architecture (imported by run.py + train.py)
 ├── requirements.txt              # pip dependencies
 ├── train.py                       # training script -- reproduces training from scratch
 ├── losses.py                       # loss functions used by train.py
 ├── dataset.py                       # paired GT/LR dataset loader used by train.py
 ├── models/
 │   └── restorenet_final.pt           # trained weights (see note below on size / LFS)
+    └──  model.py                      # RestoreNet architecture (imported by run.py + train.py)
 ├── restored_test_outputs/              # our model's actual output on the test set
 │   └── *.npy
 ├── eval.py                              # optional: earlier PNG-only inference script
-├── compute_metrics.py                    # optional: SSIM/PSNR/LPIPS on our own held-out split
-└── CHANGES.md                              # architecture/training design notes vs. the first version
+└── compute_metrics.py                    # optional: SSIM/PSNR/LPIPS on our own held-out split
 ```
 
 ## Setup
