@@ -1,45 +1,17 @@
 """
-Training script:
-  - 80/10/10 train/val/test split of the paired training set.
-  - Stage 1: pretrain encoder-decoder as a denoiser only. Target is the real
-    GT anti-alias-downsampled to LR size (a "clean LR" proxy) since the
-    dataset doesn't ship a clean-LR image directly.
-  - Stage 2: unfreeze everything, train the full pipeline (denoise+SR head)
-    end to end against the real GT, with the combined Charbonnier+SSIM+
-    perceptual+edge+range loss.
-  - AdamW + linear warmup -> per-step cosine LR decay per stage.
+Training script for RestoreNet.
 
-  - EMA (Exponential Moving Average) of model weights, decay=0.999,
-    updated every step. This is close to a "free" improvement: it doesn't
-    change what the network learns, it just evaluates/saves a temporally
-    smoothed copy of the weights instead of the noisy last-iterate. It's
-    standard in modern restoration/generative training pipelines
-    specifically because it reduces run-to-run metric variance and
-    typically nudges PSNR/SSIM/LPIPS in the right direction with no
-    architecture change. restorenet_final.pt now stores the EMA weights
-    (raw weights are also kept as restorenet_final_raw.pt in case you want
-    to compare/ablate).
-  - Mixed precision (torch.cuda.amp) on CUDA -- not a quality lever by
-    itself, but it roughly halves memory/time per step, which you can
-    spend on a bigger crop_lr or more epochs within the same time budget
-    (both of which ARE quality levers). No-ops safely on CPU.
-  - Linear warmup (first `warmup_steps` steps) into the cosine schedule,
-    stepped per-batch instead of per-epoch. LayerNorm-based blocks (NAFBlock
-    uses LayerNorm2d) are known to be more sensitive to a too-high initial
-    LR than plain BN/no-norm conv stacks; a short warmup avoids an early
-    loss spike that per-epoch cosine scheduling doesn't protect against.
-  - Gradient clipping (max_norm=1.0) -- cheap insurance against the
-    occasional large SSIM/perceptual gradient spike destabilizing training,
-    especially in stage 2 once all four+ loss terms are active together.
-  - AdamW instead of Adam (decoupled weight decay) -- minor, standard
-    swap; weight decay is small (1e-4) and mainly helps the deeper NAFBlock
-    stack generalize a bit better than the shallower original.
-  - validate() no longer needs any special handling for odd-sized
-    val/test images -- RestoreNet.forward() now pads/crops internally
-    (see model.py), which also fixes a latent bug where full, un-padded
-    validation images would previously shape-mismatch-crash on any image
-    whose H or W wasn't already a multiple of 4.
-
+- 80/10/10 train/val/test split of the paired training set.
+- Stage 1: pretrain the encoder-decoder as a plain denoiser (target is the
+  real GT anti-alias-downsampled to LR size, since we don't have a clean-LR
+  image directly). Stage 2: unfreeze everything and train the full
+  denoise+SR pipeline end to end against the real GT, with the combined
+  Charbonnier+SSIM+perceptual+edge+range loss (see losses.py).
+- AdamW, linear warmup into per-step cosine decay, gradient clipping,
+  mixed precision on CUDA, EMA of the weights (decay 0.999).
+  restorenet_final.pt holds the EMA weights; restorenet_final_raw.pt keeps
+  the raw last-iterate weights alongside it. See CHANGES.md for the reasoning
+  behind each of these.
 
 USAGE (run this on Colab/Kaggle with a GPU, not on a laptop CPU):
     python train.py --gt_dir /path/to/train/GT --lr_dir /path/to/train/NoisyLR \
@@ -49,11 +21,8 @@ USAGE (run this on Colab/Kaggle with a GPU, not on a laptop CPU):
 --gt_dir / --lr_dir must point at the two folders inside your unzipped
 train.zip. Check the actual folder names first (see README) -- this script
 does not guess them.
-
-Here's the code:
 """
 import argparse
-import copy
 import json
 import os
 import time
