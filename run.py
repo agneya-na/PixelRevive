@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from model import RestoreNet
+from models.model import RestoreNet
 
 DEFAULT_WEIGHTS = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
