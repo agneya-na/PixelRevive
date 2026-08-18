@@ -55,7 +55,7 @@ from torch.utils.data import Dataset, DataLoader
 from pytorch_msssim import ssim as ssim_fn
 import torchvision.models as tvm
 
-from model import RestoreNet, count_params
+from models.model import RestoreNet, count_params
 
 
 # ==========================================================================
