@@ -1,16 +1,10 @@
-# NOTE: the spec asks for a full `pip freeze` from your actual training
-# environment (Colab/Kaggle). If you still have that session, run:
-#     pip freeze > requirements.txt
-# and use that instead -- it'll also capture your exact CUDA build. This
-# file is a tested, minimal-but-complete fallback if you don't.
-
-torch==2.13.0
-torchvision==0.28.0
+torch==2.5.1
+torchvision==0.20.1
 numpy==2.4.4
 pillow==12.1.1
 pytorch-msssim==1.0.0
 
-# Only needed if you also run compute_metrics.py for your own SSIM/PSNR/LPIPS
-# reporting (not required by run.py or the eval spec):
-# scikit-image
-# lpips
+# only needed for compute_metrics.py (our own SSIM/PSNR/LPIPS reporting),
+# not required to run run.py or train.py
+# scikit-image==0.26.0
+# lpips==0.1.4
