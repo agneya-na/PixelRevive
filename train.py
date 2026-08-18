@@ -1,17 +1,31 @@
 """
-Training script for RestoreNet.
+Training script (SELF-CONTAINED -- dataset loading/pairing and the loss
+functions are inlined below instead of imported from dataset.py/losses.py,
+so this one file reproduces the whole training process from scratch,
+matching the repo's "Training Script" requirement).
 
-- 80/10/10 train/val/test split of the paired training set.
-- Stage 1: pretrain the encoder-decoder as a plain denoiser (target is the
-  real GT anti-alias-downsampled to LR size, since we don't have a clean-LR
-  image directly). Stage 2: unfreeze everything and train the full
-  denoise+SR pipeline end to end against the real GT, with the combined
-  Charbonnier+SSIM+perceptual+edge+range loss (see losses.py).
-- AdamW, linear warmup into per-step cosine decay, gradient clipping,
-  mixed precision on CUDA, EMA of the weights (decay 0.999).
-  restorenet_final.pt holds the EMA weights; restorenet_final_raw.pt keeps
-  the raw last-iterate weights alongside it. See CHANGES.md for the reasoning
-  behind each of these.
+Only external project dependency: model.py (RestoreNet) -- kept separate
+because run.py (the evaluation script) also needs to import it, so it has
+to stay a standalone module either way.
+
+  - 80/10/10 train/val/test split of the paired training set.
+  - Stage 1: pretrain encoder-decoder as a denoiser only. Target is the real
+    GT anti-alias-downsampled to LR size (a "clean LR" proxy) since the
+    dataset doesn't ship a clean-LR image directly.
+  - Stage 2: unfreeze everything, train the full pipeline (denoise+SR head)
+    end to end against the real GT, with the combined Charbonnier+SSIM+
+    perceptual+edge+range loss.
+  - AdamW + linear warmup -> per-step cosine LR decay per stage.
+  - EMA (Exponential Moving Average) of model weights, decay=0.999,
+    updated every step -- restorenet_final.pt stores the EMA weights
+    (raw last-iterate weights also kept as restorenet_final_raw.pt).
+  - Mixed precision (torch.cuda.amp) on CUDA; no-ops safely on CPU.
+  - Linear warmup into the cosine schedule, stepped per-batch.
+  - Gradient clipping (max_norm=1.0).
+  - Dataset loader accepts BOTH .npy files (the actual competition format --
+    2D float arrays, values roughly in [0,1] and may exceed 1.0 due to
+    speckle, NOT clipped on load) and standard image files (png/jpg/etc,
+    for local testing convenience).
 
 USAGE (run this on Colab/Kaggle with a GPU, not on a laptop CPU):
     python train.py --gt_dir /path/to/train/GT --lr_dir /path/to/train/NoisyLR \
@@ -24,17 +38,340 @@ does not guess them.
 """
 import argparse
 import json
+import math
 import os
+import random
+import re
 import time
+from pathlib import Path
+from typing import List, Tuple
 
+import numpy as np
+from PIL import Image
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
+from pytorch_msssim import ssim as ssim_fn
+import torchvision.models as tvm
 
 from model import RestoreNet, count_params
-from losses import CombinedLoss
-from dataset import PairedRestorationDataset, make_splits
 
+
+# ==========================================================================
+# Dataset (formerly dataset.py -- inlined so this file is self-contained)
+# ==========================================================================
+
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+NPY_EXTS = {".npy"}
+ALL_EXTS = IMG_EXTS | NPY_EXTS
+
+
+def _list_images(folder: str) -> List[str]:
+    return sorted(
+        f.name for f in Path(folder).iterdir()
+        if f.suffix.lower() in ALL_EXTS
+    )
+
+
+def _strip_tag(name: str) -> str:
+    """Strip common GT/LR/HR/noisy/degraded tags and extension to get a matchable stem."""
+    stem = Path(name).stem
+    stem = re.sub(r"(?i)[_\-]?(gt|hr|lr|noisy|degraded|clean|ground[_\-]?truth)$", "", stem)
+    stem = re.sub(r"(?i)^(gt|hr|lr|noisy|degraded|clean)[_\-]?", "", stem)
+    return stem.lower()
+
+
+def pair_files(gt_dir: str, lr_dir: str) -> List[Tuple[str, str]]:
+    """
+    Pairing strategy (in order, first one that covers all files wins):
+      1. Exact same filename in both folders.
+      2. Same filename after stripping a common suffix/prefix, e.g.
+         "0001_HR.npy" <-> "0001_LR.npy", "0001_GT.png" <-> "0001_noisy.png".
+      3. Fallback: same sorted position in each folder (risky -- prints a
+         warning and the first 3 pairs so you can sanity-check them).
+    """
+    gt_files = _list_images(gt_dir)
+    lr_files = _list_images(lr_dir)
+    if not gt_files or not lr_files:
+        raise RuntimeError(f"No images found. gt_dir has {len(gt_files)}, lr_dir has {len(lr_files)}.")
+
+    # 1. exact filename match
+    common = sorted(set(gt_files) & set(lr_files))
+    if len(common) == len(gt_files) == len(lr_files):
+        return [(g, g) for g in common]
+
+    # 2. stripped-stem match
+    gt_by_stem = {_strip_tag(f): f for f in gt_files}
+    lr_by_stem = {_strip_tag(f): f for f in lr_files}
+    stems = sorted(set(gt_by_stem) & set(lr_by_stem))
+    if len(stems) == len(gt_files) == len(lr_files):
+        return [(gt_by_stem[s], lr_by_stem[s]) for s in stems]
+
+    # 3. fallback: sorted-order pairing
+    n = min(len(gt_files), len(lr_files))
+    print(
+        f"[dataset] WARNING: could not match filenames 1:1 between\n"
+        f"  gt_dir={gt_dir} ({len(gt_files)} files)\n"
+        f"  lr_dir={lr_dir} ({len(lr_files)} files)\n"
+        f"  Falling back to sorted-order pairing for the first {n} files.\n"
+        f"  First 3 pairs: {list(zip(gt_files[:3], lr_files[:3]))}\n"
+        f"  >>> VERIFY these are actually the same scenes before trusting training. <<<"
+    )
+    return list(zip(gt_files[:n], lr_files[:n]))
+
+
+def _load_gray01(path: str) -> np.ndarray:
+    """Load as float32 2D grayscale array. Supports both .npy and images.
+
+    .npy: trusted as already-normalized float (NOT clipped -- degraded
+    arrays may legitimately exceed 1.0 due to speckle), unless it's an
+    integer array, in which case it's assumed to be [0,255] and scaled down.
+    NaN/Inf are sanitized. (H,W,1) is squeezed to (H,W).
+    Images: standard PIL grayscale load, /255.
+    """
+    if path.lower().endswith(".npy"):
+        arr = np.load(path)
+        if arr.ndim == 3:
+            if arr.shape[-1] == 1:
+                arr = arr[..., 0]
+            elif arr.shape[0] == 1:
+                arr = arr[0]
+            else:
+                raise ValueError(f"{path}: expected a grayscale array, got shape {arr.shape}")
+        if arr.ndim != 2:
+            raise ValueError(f"{path}: expected a 2D array after squeeze, got shape {arr.shape}")
+        arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)
+        if np.issubdtype(arr.dtype, np.integer):
+            arr = arr.astype(np.float32) / 255.0
+        else:
+            arr = arr.astype(np.float32)
+        return arr
+    else:
+        img = Image.open(path).convert("L")
+        return np.asarray(img, dtype=np.float32) / 255.0
+
+
+def synthetic_redegrade(lr: np.ndarray, p: float = 0.3) -> np.ndarray:
+    """Extra speckle + gaussian noise on an already-degraded LR patch (slide 5 augmentation)."""
+    if random.random() > p:
+        return lr
+    out = lr.copy()
+    if random.random() < 0.5:
+        sigma = random.uniform(0.02, 0.08)
+        out = out + out * np.random.normal(0, sigma, out.shape).astype(np.float32)  # speckle
+    if random.random() < 0.5:
+        sigma = random.uniform(0.01, 0.05)
+        out = out + np.random.normal(0, sigma, out.shape).astype(np.float32)  # gaussian
+    return out.astype(np.float32)
+
+
+class PairedRestorationDataset(Dataset):
+    def __init__(
+        self,
+        gt_dir: str,
+        lr_dir: str,
+        pairs: List[Tuple[str, str]] = None,
+        crop_lr: int = 128,
+        train: bool = True,
+        redegrade_p: float = 0.3,
+    ):
+        self.gt_dir = gt_dir
+        self.lr_dir = lr_dir
+        self.pairs = pairs if pairs is not None else pair_files(gt_dir, lr_dir)
+        self.crop_lr = crop_lr
+        self.train = train
+        self.redegrade_p = redegrade_p
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        gt_name, lr_name = self.pairs[idx]
+        gt = _load_gray01(os.path.join(self.gt_dir, gt_name))
+        lr = _load_gray01(os.path.join(self.lr_dir, lr_name))
+
+        if gt.shape[0] != 2 * lr.shape[0] or gt.shape[1] != 2 * lr.shape[1]:
+            raise ValueError(
+                f"Resolution mismatch for pair ({gt_name}, {lr_name}): "
+                f"GT={gt.shape}, LR={lr.shape}. Expected GT to be exactly 2x LR in both dims."
+            )
+
+        if self.train:
+            lr, gt = self._augment(lr, gt)
+
+        lr_t = torch.from_numpy(lr).unsqueeze(0).float()
+        gt_t = torch.from_numpy(gt).unsqueeze(0).float()
+        return lr_t, gt_t
+
+    def _augment(self, lr: np.ndarray, gt: np.ndarray):
+        h, w = lr.shape
+        c = min(self.crop_lr, h, w)
+        # RestoreNet downsamples via PixelUnshuffle (2x twice), which
+        # requires the LR crop's H and W to divide evenly by 4. Round down
+        # to the nearest multiple of 4 so every crop is valid regardless of
+        # the source image's raw dimensions.
+        c = max(4, (c // 4) * 4)
+        top = random.randint(0, h - c) if h > c else 0
+        left = random.randint(0, w - c) if w > c else 0
+        lr_c = lr[top:top + c, left:left + c]
+        gt_c = gt[top * 2:(top + c) * 2, left * 2:(left + c) * 2]
+
+        if random.random() < 0.5:
+            lr_c, gt_c = np.fliplr(lr_c).copy(), np.fliplr(gt_c).copy()
+        if random.random() < 0.5:
+            lr_c, gt_c = np.flipud(lr_c).copy(), np.flipud(gt_c).copy()
+        k = random.randint(0, 3)
+        if k:
+            lr_c, gt_c = np.rot90(lr_c, k).copy(), np.rot90(gt_c, k).copy()
+
+        lr_c = synthetic_redegrade(lr_c, p=self.redegrade_p)
+        return lr_c, gt_c
+
+
+def make_splits(gt_dir: str, lr_dir: str, val_frac=0.1, test_frac=0.1, seed=42):
+    """80/10/10 split (slide 4 'Training Strategy'). Returns 3 lists of (gt_name, lr_name)."""
+    pairs = pair_files(gt_dir, lr_dir)
+    rng = random.Random(seed)
+    pairs = pairs[:]
+    rng.shuffle(pairs)
+    n = len(pairs)
+    n_val = max(1, int(n * val_frac))
+    n_test = max(1, int(n * test_frac))
+    test = pairs[:n_test]
+    val = pairs[n_test:n_test + n_val]
+    train = pairs[n_test + n_val:]
+    return train, val, test
+
+
+# ==========================================================================
+# Losses (formerly losses.py -- inlined so this file is self-contained)
+# ==========================================================================
+
+class CharbonnierLoss(nn.Module):
+    """Smooth L1 variant: sqrt((pred-target)^2 + eps^2). eps=1e-3 matches
+    common usage in EDSR/LapSRN-style restoration nets."""
+
+    def __init__(self, eps: float = 1e-3):
+        super().__init__()
+        self.eps2 = eps * eps
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        diff = pred - target
+        return torch.mean(torch.sqrt(diff * diff + self.eps2))
+
+
+class SobelEdgeLoss(nn.Module):
+    """L1 distance between Sobel-gradient magnitudes of pred and target.
+    Directly rewards sharp, well-placed edges -- the kind of high-frequency
+    correctness LPIPS is most sensitive to."""
+
+    def __init__(self):
+        super().__init__()
+        kx = torch.tensor([[1., 0., -1.], [2., 0., -2.], [1., 0., -1.]]).view(1, 1, 3, 3)
+        ky = kx.transpose(2, 3).contiguous()
+        self.register_buffer("kx", kx)
+        self.register_buffer("ky", ky)
+
+    def _grad_mag(self, x: torch.Tensor) -> torch.Tensor:
+        gx = F.conv2d(x, self.kx, padding=1)
+        gy = F.conv2d(x, self.ky, padding=1)
+        return torch.sqrt(gx * gx + gy * gy + 1e-6)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return F.l1_loss(self._grad_mag(pred), self._grad_mag(target))
+
+
+class VGGPerceptual(nn.Module):
+    """VGG16 relu2_2 + relu3_3 feature distance, weighted combination.
+    Images are single-channel; VGG expects 3-channel input, so the channel
+    is repeated x3. VGG weights are frozen (eval mode, no grad)."""
+
+    def __init__(self, layers=("relu2_2", "relu3_3"), layer_weights=(0.5, 1.0)):
+        super().__init__()
+        vgg = tvm.vgg16(weights=tvm.VGG16_Weights.IMAGENET1K_V1).features
+        cuts = {"relu2_2": 9, "relu3_3": 16}
+        self.layers = list(layers)
+        self.layer_weights = list(layer_weights)
+        self.cuts = {l: cuts[l] for l in self.layers}
+        max_cut = max(self.cuts.values())
+        self.slice = nn.Sequential(*[vgg[i] for i in range(max_cut)]).eval()
+        for p in self.slice.parameters():
+            p.requires_grad = False
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def _features(self, x3: torch.Tensor) -> dict:
+        feats = {}
+        h = x3
+        wanted = set(self.cuts.values())
+        for i, layer in enumerate(self.slice):
+            h = layer(h)
+            if (i + 1) in wanted:
+                for name, cut in self.cuts.items():
+                    if cut == i + 1:
+                        feats[name] = h
+        return feats
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        x3 = (x.repeat(1, 3, 1, 1) - self.mean) / self.std
+        y3 = (y.repeat(1, 3, 1, 1) - self.mean) / self.std
+        with torch.no_grad():
+            fy = self._features(y3)
+        fx = self._features(x3)
+        loss = x.new_zeros(())
+        for name, w in zip(self.layers, self.layer_weights):
+            loss = loss + w * F.l1_loss(fx[name], fy[name])
+        return loss
+
+
+class CombinedLoss(nn.Module):
+    """total = w_l1*Charbonnier + w_ssim*(1-SSIM) + w_perc*VGG-perceptual
+               + w_range*RangePenalty + w_edge*SobelEdge"""
+
+    def __init__(self, w_l1=1.0, w_ssim=0.5, w_perc=0.1, w_range=0.05,
+                 w_edge=0.05, use_perceptual=True, use_charbonnier=True):
+        super().__init__()
+        self.w_l1 = w_l1
+        self.w_ssim = w_ssim
+        self.w_perc = w_perc
+        self.w_range = w_range
+        self.w_edge = w_edge
+        self.use_perceptual = use_perceptual
+        self.pixel_loss = CharbonnierLoss() if use_charbonnier else nn.L1Loss()
+        self.edge_loss = SobelEdgeLoss()
+        if use_perceptual:
+            self.vgg = VGGPerceptual()
+
+    def range_penalty(self, raw: torch.Tensor) -> torch.Tensor:
+        over = F.relu(raw - 1.0)
+        under = F.relu(-raw)
+        return (over.pow(2).mean() + under.pow(2).mean())
+
+    def forward(self, pred: torch.Tensor, pred_raw: torch.Tensor, target: torch.Tensor):
+        pixel = self.pixel_loss(pred, target)
+        ssim_val = ssim_fn(pred, target, data_range=1.0, size_average=True)
+        ssim_loss = 1.0 - ssim_val
+        range_loss = self.range_penalty(pred_raw)
+        edge_loss = self.edge_loss(pred, target)
+
+        total = (self.w_l1 * pixel + self.w_ssim * ssim_loss
+                 + self.w_range * range_loss + self.w_edge * edge_loss)
+        logs = {"pixel": pixel.item(), "ssim_loss": ssim_loss.item(),
+                "range": range_loss.item(), "edge": edge_loss.item()}
+
+        if self.use_perceptual:
+            perc = self.vgg(pred, target)
+            total = total + self.w_perc * perc
+            logs["perc"] = perc.item()
+
+        logs["total"] = total.item()
+        return total, logs
+
+
+# ==========================================================================
+# Training
+# ==========================================================================
 
 def get_device(pref: str) -> torch.device:
     if pref == "auto":
@@ -72,7 +409,6 @@ def build_scheduler(opt, warmup_steps: int, total_steps: int):
             return (step + 1) / warmup_steps
         prog = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         prog = min(1.0, prog)
-        import math
         return 0.5 * (1.0 + math.cos(math.pi * prog))
 
     return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
@@ -82,7 +418,6 @@ def build_scheduler(opt, warmup_steps: int, total_steps: int):
 def validate(model, loader, device):
     model.eval()
     tot_l1, tot_ssim, n = 0.0, 0.0, 0
-    from pytorch_msssim import ssim as ssim_fn
     for lr, gt in loader:
         lr, gt = lr.to(device), gt.to(device)
         pred, _ = model(lr, stage=2)
@@ -178,7 +513,7 @@ def run_stage2(model, train_loader, val_loader, device, epochs, lr, out_dir, los
 
     save_checkpoint(model, out_dir, "restorenet_final_raw.pt")
     save_checkpoint(model, out_dir, "restorenet_final.pt", state_dict=ema.state_dict())
-    print("restorenet_final.pt holds the EMA weights (what eval.py/compute_metrics.py will load).")
+    print("restorenet_final.pt holds the EMA weights (what run.py will load).")
     print("restorenet_final_raw.pt holds the plain last-iterate weights, kept for comparison.")
 
 
@@ -194,18 +529,18 @@ def save_checkpoint(model, out_dir, name, state_dict=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gt_dir", required=True, help="folder with clean/GT images")
-    ap.add_argument("--lr_dir", required=True, help="folder with degraded/LR images")
+    ap.add_argument("--gt_dir", required=True, help="folder with clean/GT images (.npy or images)")
+    ap.add_argument("--lr_dir", required=True, help="folder with degraded/LR images (.npy or images)")
     ap.add_argument("--out_dir", default="checkpoints")
     ap.add_argument("--epochs_stage1", type=int, default=15)
     ap.add_argument("--epochs_stage2", type=int, default=40)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--crop_lr", type=int, default=128)
     ap.add_argument("--base_ch", type=int, default=64,
-                     help="v2 default raised 48->64: NAFBlock is cheaper per-block than the "
-                          "old ResBlock (see model.py), so this still nets FEWER total params "
-                          "than the original base_ch=48 model while adding capacity.")
-    ap.add_argument("--n_res", type=int, default=4, help="NAFBlocks per stage (v2 default 3->4)")
+                     help="NAFBlock is cheaper per-block than a plain ResBlock, so base_ch=64/"
+                          "n_res=4 still nets fewer total params than a base_ch=48/n_res=3 model "
+                          "of the old block type, while adding capacity.")
+    ap.add_argument("--n_res", type=int, default=4, help="NAFBlocks per stage")
     ap.add_argument("--lr1", type=float, default=2e-4, help="stage 1 learning rate")
     ap.add_argument("--lr2", type=float, default=1e-4, help="stage 2 learning rate")
     ap.add_argument("--warmup_steps", type=int, default=300, help="linear LR warmup steps, each stage")
@@ -217,9 +552,9 @@ def main():
     ap.add_argument("--no_perceptual", action="store_true", help="disable VGG loss (faster, needs no internet)")
     ap.add_argument("--w_l1", type=float, default=1.0, help="weight on the Charbonnier pixel loss")
     ap.add_argument("--w_ssim", type=float, default=0.5)
-    ap.add_argument("--w_perc", type=float, default=0.15, help="v2 default raised 0.1->0.15 (see README)")
+    ap.add_argument("--w_perc", type=float, default=0.15)
     ap.add_argument("--w_range", type=float, default=0.05)
-    ap.add_argument("--w_edge", type=float, default=0.05, help="Sobel edge-sharpness loss weight (new)")
+    ap.add_argument("--w_edge", type=float, default=0.05, help="Sobel edge-sharpness loss weight")
     ap.add_argument("--no_charbonnier", action="store_true", help="use plain L1 instead of Charbonnier")
     args = ap.parse_args()
 
@@ -232,8 +567,7 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     with open(os.path.join(args.out_dir, "test_split.json"), "w") as f:
         json.dump(test_pairs, f, indent=2)
-    print(f"test split saved to {args.out_dir}/test_split.json -- reuse this for compute_metrics.py "
-          f"so metrics are computed on data the model never trained on.")
+    print(f"test split saved to {args.out_dir}/test_split.json")
 
     train_ds = PairedRestorationDataset(args.gt_dir, args.lr_dir, pairs=train_pairs,
                                          crop_lr=args.crop_lr, train=True)
@@ -265,7 +599,6 @@ def main():
     print(f"\n=== DONE ===")
     print(f"total training time: {total_time/60:.1f} min")
     print(f"final checkpoint: {final_path}  ({size_mb:.1f} MB)")
-    print(f"-> copy these two numbers into slide 7 (Training Time, Model Size)")
 
 
 if __name__ == "__main__":
