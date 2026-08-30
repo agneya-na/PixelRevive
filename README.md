@@ -246,14 +246,29 @@ required packages are: `torch`, `torchvision`, `numpy`, `pillow`,
 
 ---
 
+# 0) sanity-check the new model file compiles and passes self-tests
+python models/model.py   # if placed at models/model.py run: python -m models.model ... or just:
+                         # python -c "from models.model import RestoreNet, count_params; print(count_params(RestoreNet()))"
+
+# 1) retrain (old weights are still loadable, but the v3 gains need retraining)
+python train.py \
+  --gt_dir /path/to/train/GT --lr_dir /path/to/train/NoisyLR \
+  --out_dir checkpoints \
+  --epochs_stage1 15 --epochs_stage2 80 --epochs_stage3 5 \
+  --batch_size 16 --crop_lr 128 --base_ch 64 --n_res 4 --n_middle 8
+
+# 2) promote best weights (start with best-by-SSIM EMA; also try best_psnr)
+cp checkpoints/restorenet_best_ema.pt models/restorenet_final.pt
+
+# 3) regenerate test outputs (TTA-8 on by default) and re-measure
+python run.py <path_to_train_NoisyLR> restored_check_outputs
+python evaluate.py --gt_dir /path/to/train/GT \
+  --pred_dir restored_check_outputs --split_json checkpoints/test_split.json
+
+
 ## Architecture
 
-`RestoreNet`: NAFNet-style encoder-decoder (SimpleGate + simplified channel
-attention + LayerNorm blocks) with PixelUnshuffle/PixelShuffle down/up-
-sampling, skip connections, an auxiliary LR denoise head (Stage 1 target),
-and a PixelShuffle super-resolution head with global residual learning on a
-bicubic-upsampled input. See `models/model.py` for the full architecture
-and design rationale in the module docstring.
+`RestoreNet`: NAFNet-style encoder-decoder (SimpleGate + simplified channel attention + LayerNorm blocks) with PixelUnshuffle/PixelShuffle down/up-sampling, concat+1x1 skip fusion, a deep 8-block bottlencek (--n_middle), a pre_sr refinement block, an auxiliary LR denoise head (Stage-1 target, plus a small auxiliary loss during Stage 2), and a PixelShuffle super-resolution head with global residual learning on a bicubic-upsampled input. Training uses a combined Charbonnier + SSIM + VGG-perceptual + Sobel-edge + frequency-domain + range-penalty loss, per-stage cosine schedules, EMA weights, and an optional pixel-only polish stage. Inference uses an 8-way geometric self-ensemble (TTA). See models/model.py for the module-level design notes
 
 ---
 Team: `PixelRevive`
