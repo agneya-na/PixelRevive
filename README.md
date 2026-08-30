@@ -127,8 +127,9 @@ want to run inference with our already-trained weights, skip to Section 2.
 python train.py \
   --gt_dir /path/to/train/GT --lr_dir /path/to/train/NoisyLR \
   --out_dir checkpoints \
-  --epochs_stage1 15 --epochs_stage2 40 \
-  --batch_size 16 --crop_lr 128
+  --epochs_stage1 15 --epochs_stage2 80 --epochs_stage3 5 \
+  --batch_size 16 --crop_lr 128 --base_ch 64 --n_res 4 --n_middle 8
+
 ```
 - `--gt_dir` / `--lr_dir` must point at the two folders inside the unzipped
   training data (the clean/ground-truth images and the degraded/noisy-LR
