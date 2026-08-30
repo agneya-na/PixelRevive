@@ -100,6 +100,7 @@ creates it automatically if it doesn't already exist.
 |---|---|---|
 | `--weights <path>` | `models/restorenet_final.pt` | Use a different checkpoint file |
 | `--device` | `auto` | Force `cuda` or `cpu` instead of auto-detecting |
+| `--tta {1,4,8}` | `8` | Test-time self-ensemble (rotations x mirroring, averaged). 8 = best quality (default); each step multiplies per-file time. Use `--tta 1` to disable. |
 
 Example using both:
 ```bash
